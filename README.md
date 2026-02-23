@@ -1,29 +1,46 @@
-# Marketing Mix Model — Diminishing Returns with PyMC
+# Marketing Mix Model v2 — Adstock + Diminishing Returns with PyMC
+
+## What Changed from v1
+
+Version 1 modelled only **saturation** (diminishing returns via the Hill function). Version 2 adds **geometric adstock** before saturation, creating the standard two-stage media transformation pipeline used in production MMMs:
+
+```
+raw spend → adstock(λ) → Hill(K, S) → β·saturated → Σ + α → sales
+```
+
+### Why Adstock Before Saturation?
+
+Advertising effects don't vanish the moment you stop spending. A TV ad seen on Monday still influences purchase decisions on Tuesday and Wednesday — this is the **carryover** or **adstock** effect. By applying adstock *before* the Hill function, we model a realistic pipeline:
+
+1. **Adstock** accumulates and decays spend over time → "effective exposure"
+2. **Hill saturation** maps effective exposure to a bounded sales response
+
+The ordering matters. Applying saturation first would compress spend into [0, 1] before accumulation, losing the important distinction between "one big day" and "sustained moderate spend over a week." The adstock-then-saturate ordering is the standard in Meta Robyn, Google Meridian, and the academic MMM literature (Jin et al., 2017).
+
+---
 
 ## Model Specification
 
-Daily sales are modelled as a linear combination of saturated media channel effects:
+$$\text{sales} = \alpha + \sum_{c} \beta_c \cdot \text{hill}\bigl(\text{adstock}(x_c;\; \lambda_c);\; K_c, S_c\bigr) + \varepsilon$$
 
-$$\text{sales} = \alpha + \sum_{c} \beta_c \cdot \text{hill}(x_c;\; K_c, S_c) + \varepsilon$$
+**Geometric Adstock:**
 
-where the **Hill saturation function** is:
+$$\text{adstock}_t = x_t + \lambda_c \cdot \text{adstock}_{t-1}$$
+
+where $\lambda_c \in [0, 1)$ is the decay (retention) rate. The half-life of the carryover effect is $t_{1/2} = -\ln 2 / \ln \lambda$.
+
+After adstock, the series is re-normalised to [0, 1] before entering the Hill function.
+
+**Hill Saturation Function:**
 
 $$\text{hill}(x;\; K, S) = \frac{x^S}{K^S + x^S}$$
-
-applied to max-normalised daily spend per channel. This is a standard dose–response curve borrowed from pharmacokinetics and widely used in MMM frameworks (Meta Robyn, Google Meridian). It maps any spend level to a value in [0, 1], naturally capturing the economic intuition that each additional dollar of spend yields less incremental return.
-
-### Why Hill?
-
-- **Bounded in [0, 1]** — prevents extrapolation blow-up, unlike power-law ($x^\alpha$) which is unbounded.
-- **Interpretable parameters** — $K$ tells you "how fast does this channel saturate?" and $S$ tells you "how sharp is the curve?"
-- **Industry standard** — default in Meta's Robyn and Google's Meridian / LightweightMMM.
-- A power-law $x^\alpha$ is unbounded and can overfit high spenders; $\log(1+x)$ lacks a natural ceiling.
 
 ### Parameters
 
 | Parameter | Description |
 |-----------|-------------|
-| $K_c$ (half-saturation) | The normalised spend level at which channel $c$ reaches 50% of its maximum effect |
+| $\lambda_c$ (decay rate) | Carryover retention per day for channel $c$. λ=0 means no carryover; λ=0.7 means ~2-day half-life |
+| $K_c$ (half-saturation) | The effective-exposure level at which channel $c$ reaches 50% of its maximum effect |
 | $S_c$ (Hill exponent) | Controls curvature — $S \approx 1$ gives Michaelis–Menten; $S > 1$ creates an S-shape |
 | $\beta_c$ (coefficient) | Maximum possible sales lift (in z-scored units) from channel $c$ at full saturation |
 | $\alpha$ (intercept) | Baseline sales level when all channels are at zero spend |
@@ -35,42 +52,53 @@ applied to max-normalised daily spend per channel. This is a standard dose–res
 
 | Parameter | Prior | Rationale |
 |-----------|-------|-----------|
-| $K$ | Beta(2, 2) | Symmetric prior on [0, 1], mildly informative. Centres the half-saturation point at 50% of observed max spend but has enough variance to let data push $K$ toward 0 (fast saturation) or 1 (slow saturation). Chosen over Uniform to down-weight extreme values ($K \approx 0$ or $1$) which would imply instant or never-reached saturation. |
-| $S$ | Gamma(3, 1) | Centres the Hill exponent around 2–3 (mode = 2). Gently regularises toward smooth concave/sigmoid curves. Extremely large $S$ creates a near-step-function, which is economically implausible for advertising; the Gamma tail penalises that without ruling it out. |
-| $\beta_c$ | HalfNormal(1) | Enforces the sign constraint (more spend should not decrease sales) and places most prior mass on 0–2 z-scored standard deviations of sales contribution per channel — reasonable for five channels sharing a total effect. |
-| $\alpha$ | Normal(0, 0.5) | Weakly informative in z-space; centred at the mean by construction of the z-score transform. |
-| $\sigma$ | HalfNormal(0.5) | Weakly informative; we expect a decent fit so residual std should be well below 1 z-unit. |
+| $\lambda$ | Beta(2, 5) | Mode ≈ 0.17, mean ≈ 0.29. Most advertising carryover decays within a few days. This prior centres on fast decay while allowing moderate carryover (λ ≈ 0.5–0.7 for TV) if the data supports it. Chosen over Beta(1,1)/Uniform because very high λ values (>0.9) imply month-long half-lives, which are implausible for direct sales response. |
+| $K$ | Beta(2, 2) | Same as v1. Symmetric prior on [0, 1], mildly informative. |
+| $S$ | Gamma(3, 1) | Same as v1. Centres the Hill exponent around 2–3. |
+| $\beta_c$ | HalfNormal(1) | Same as v1. Enforces positivity and mild regularisation. |
+| $\alpha$ | Normal(0, 0.5) | Weakly informative in z-space. |
+| $\sigma$ | HalfNormal(0.5) | Weakly informative. |
+
+### Note on Identifiability
+
+Adding adstock introduces potential identifiability tension between λ (how much carry-over) and K (where saturation kicks in). A channel with high λ and low K can produce similar fits to one with low λ and high K. The informative priors on both parameters help regularise this, and the diagnostic checks (r̂, ESS, divergences) should be examined carefully. If identifiability issues arise, consider:
+
+1. Fixing λ for one channel as a reference
+2. Using stronger priors informed by experimental data (e.g., geo-lift tests)
+3. Reparameterising λ via logit-normal for better sampling geometry
 
 ---
 
-## Sampling Diagnostics
+## Sampling Configuration
 
-The model was sampled with 4 NUTS chains (1,500 tuning + 2,000 draws each, `target_accept=0.95`). Key diagnostics:
-
-- **0 divergences** across all chains
-- **r̂ = 1.000** for all parameters (perfect convergence)
-- **Effective sample sizes (ESS)** ranging from ~3,000 to ~10,000 (well above recommended minimums)
+| Setting | v1 | v2 | Rationale for change |
+|---------|----|----|---------------------|
+| Tune | 1,500 | 2,000 | Adstock scan creates longer dependency chains |
+| Draws | 2,000 | 2,000 | Unchanged |
+| Chains | 4 | 4 | Unchanged |
+| target_accept | 0.95 | 0.97 | Higher to handle scan-induced posterior geometry |
 
 ---
 
-## What the Prior vs Posterior Curves Show
+## Outputs
 
-The **prior curves** (light, spread-out spaghetti lines) show the wide range of saturation behaviours the model considers plausible *before* seeing any data. They span nearly the full [0, 1] range of shapes — from nearly linear to sharply saturating.
+The script generates five plots in `./results/`:
 
-The **posterior curves** (dark/bold lines) collapse into a much narrower band after fitting, showing what the data actually supports. For each channel:
+| File | Description |
+|------|-------------|
+| `adstock_decay.png` | Impulse response curves and posterior distributions of λ per channel |
+| `prior_vs_posterior_curves_v2.png` | Prior vs posterior Hill saturation curves (same as v1 but with adstock-adjusted K values) |
+| `posterior_params_v2.png` | KDE plots of all four parameter types: K, S, β, λ |
+| `posterior_predictive_v2.png` | Observed sales vs model posterior predictive (90% interval) |
+| `channel_decomposition_v2.png` | Stacked area chart showing each channel's contribution to sales over time |
 
-- The **steepness** tells you how quickly returns diminish.
-- The **K₅₀ dashed line** marks the spend level at which the channel reaches half its maximum effect — a key budget planning insight.
-- Channels where the posterior band is still wide (e.g., Social) have more uncertainty in their saturation shape, while channels with tight posteriors (e.g., Display, Search) are well-identified by the data.
+---
 
-### Key Posterior Findings
+## What's Still Missing (v3 Roadmap)
 
-| Channel | K₅₀ (half-saturation spend) | S (shape) | β (max effect) | Interpretation |
-|---------|------------------------------|-----------|-----------------|----------------|
-| TV | ~$52k/day | ~4.7 (steep S-curve) | 0.95 | Moderate effect, saturates at higher spend |
-| Radio | ~$14k/day | ~1.7 (gentle concave) | 1.30 | Strong steady contribution, gradual saturation |
-| Social | ~$5k/day | ~2.3 (moderate) | 0.42 | Smaller effect, saturates relatively early |
-| Display | ~$39k/day | ~3.8 (steep) | 2.25 | Large but quickly-saturating effect on active days |
-| Search | ~$94k/day | ~3.4 (steep) | 4.65 | Largest per-activation effect, high saturation ceiling |
-
-Display and Search are bursty channels (active on only ~8% and ~3% of days respectively), so their high β values reflect large sales lifts on the days they fire, with tight posterior uncertainty driven by the sharp contrast between on/off days.
+- **Trend & seasonality** — linear/spline trend + Fourier terms or day-of-week effects
+- **Control variables** — pricing, promotions, holidays, competitor activity
+- **Weibull adstock** — more flexible than geometric; can model delayed peak effects
+- **Out-of-sample validation** — time-based train/test split with MAPE and coverage metrics
+- **Budget optimiser** — marginal ROI–based reallocation given the fitted model
+- **Experimental calibration** — using geo-lift test results as informative priors on β
